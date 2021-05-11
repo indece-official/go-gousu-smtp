@@ -58,6 +58,7 @@ type Service struct {
 	runningFuncs sync.WaitGroup
 	error        error
 	lastSend     *time.Time
+	mutexCloser  sync.Mutex
 }
 
 var _ IService = (*Service)(nil)
@@ -65,6 +66,26 @@ var _ IService = (*Service)(nil)
 // Name returns the name of the smtp service from ServiceName
 func (s *Service) Name() string {
 	return ServiceName
+}
+
+func (s *Service) autoclose() {
+	s.mutexCloser.Lock()
+	defer s.mutexCloser.Unlock()
+
+	if s.closer == nil {
+		return
+	}
+
+	if s.lastSend == nil || time.Since(*s.lastSend) < 40*time.Second {
+		return
+	}
+
+	err := (*s.closer).Close()
+	if err != nil {
+		s.log.Warnf("Can't close smtp connection: %s", err)
+	}
+
+	s.closer = nil
 }
 
 // Start starts the SMTP-Sender in a separate thread
@@ -81,7 +102,7 @@ func (s *Service) Start() error {
 	go func() {
 		defer s.runningFuncs.Done()
 
-		ticker := time.NewTicker(15 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
 		for {
@@ -91,20 +112,7 @@ func (s *Service) Start() error {
 			// Close the connection to the SMTP server if no email was sent in
 			// the last 30 seconds.
 			case <-ticker.C:
-				if s.closer == nil {
-					continue
-				}
-
-				if s.lastSend == nil || time.Since(*s.lastSend) < 30*time.Second {
-					continue
-				}
-
-				err := (*s.closer).Close()
-				if err != nil {
-					s.log.Warnf("Can't close smtp connection: %s", err)
-				}
-
-				s.closer = nil
+				s.autoclose()
 			}
 		}
 	}()
@@ -117,6 +125,9 @@ func (s *Service) Stop() error {
 	s.stop <- true
 
 	s.runningFuncs.Wait()
+
+	s.mutexCloser.Lock()
+	defer s.mutexCloser.Unlock()
 
 	if s.closer != nil {
 		(*s.closer).Close()
@@ -170,6 +181,9 @@ func (s *Service) SendEmail(m *Email) error {
 		}
 	}
 
+	s.mutexCloser.Lock()
+	defer s.mutexCloser.Unlock()
+
 	if s.closer == nil {
 		closer, err := s.dialer.Dial()
 		if err != nil {
@@ -185,8 +199,10 @@ func (s *Service) SendEmail(m *Email) error {
 
 	err = mail.Send(*s.closer, msg)
 	if err != nil {
-		(*s.closer).Close()
-		s.closer = nil
+		if s.closer != nil {
+			(*s.closer).Close()
+			s.closer = nil
+		}
 
 		return err
 	}
