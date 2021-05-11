@@ -3,6 +3,7 @@ package goususmtp
 import (
 	"bytes"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-mail/mail"
@@ -50,10 +51,13 @@ type IService interface {
 
 // Service provides an smtp sender running in a separate thread
 type Service struct {
-	log        *gousu.Log
-	channelIn  chan *mail.Message
-	channelOut chan error
-	error      error
+	log          *gousu.Log
+	dialer       *mail.Dialer
+	closer       *mail.SendCloser
+	stop         chan bool
+	runningFuncs sync.WaitGroup
+	error        error
+	lastSend     *time.Time
 }
 
 var _ IService = (*Service)(nil)
@@ -65,50 +69,42 @@ func (s *Service) Name() string {
 
 // Start starts the SMTP-Sender in a separate thread
 func (s *Service) Start() error {
+	s.stop = make(chan bool)
+
+	s.dialer = mail.NewDialer(*smtpHost, *smtpPort, *smtpUser, *smtpPassword)
+	s.dialer.Timeout = 35 * time.Second
+	s.dialer.RetryFailure = true
+
+	s.log.Infof("SMTP-Service started, ready to send emails")
+
+	s.runningFuncs.Add(1)
 	go func() {
-		dialer := mail.NewDialer(*smtpHost, *smtpPort, *smtpUser, *smtpPassword)
-		dialer.Timeout = 35 * time.Second
-		dialer.RetryFailure = true
+		defer s.runningFuncs.Done()
 
-		var closer mail.SendCloser
-		var err error
-		open := false
-
-		s.log.Infof("SMTP-Service started, ready to send emails")
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
 
 		for {
 			select {
-			case m, ok := <-s.channelIn:
-				if !ok {
-					return
-				}
-				if !open {
-					if closer, err = dialer.Dial(); err != nil {
-						s.error = err
-						// TODO: Retry
-						continue
-					}
-					open = true
-					s.error = nil
-				}
-				if err := mail.Send(closer, m); err != nil {
-					closer.Close()
-					open = false
-					s.channelOut <- err
+			case <-s.stop:
+				return
+			// Close the connection to the SMTP server if no email was sent in
+			// the last 30 seconds.
+			case <-ticker.C:
+				if s.closer == nil {
 					continue
 				}
 
-				s.channelOut <- nil
-
-			// Close the connection to the SMTP server if no email was sent in
-			// the last 30 seconds.
-			case <-time.After(30 * time.Second):
-				if open {
-					if err := closer.Close(); err != nil {
-						s.log.Warnf("Can't close smtp connection: %s", err)
-					}
-					open = false
+				if s.lastSend == nil || time.Since(*s.lastSend) < 30*time.Second {
+					continue
 				}
+
+				err := (*s.closer).Close()
+				if err != nil {
+					s.log.Warnf("Can't close smtp connection: %s", err)
+				}
+
+				s.closer = nil
 			}
 		}
 	}()
@@ -118,8 +114,13 @@ func (s *Service) Start() error {
 
 // Stop stops the SMTP-Sender thread
 func (s *Service) Stop() error {
-	close(s.channelIn)
-	close(s.channelOut)
+	s.stop <- true
+
+	s.runningFuncs.Wait()
+
+	if s.closer != nil {
+		(*s.closer).Close()
+	}
 
 	return nil
 }
@@ -135,6 +136,8 @@ func (s *Service) Health() error {
 
 // SendEmail sents a mail via SMTP
 func (s *Service) SendEmail(m *Email) error {
+	var err error
+
 	msg := mail.NewMessage()
 
 	from := m.From
@@ -167,17 +170,34 @@ func (s *Service) SendEmail(m *Email) error {
 		}
 	}
 
-	s.channelIn <- msg
+	if s.closer == nil {
+		closer, err := s.dialer.Dial()
+		if err != nil {
+			s.error = nil
+			return err
+		}
 
-	return <-s.channelOut
+		s.error = nil
+		now := time.Now()
+		s.lastSend = &now
+		s.closer = &closer
+	}
+
+	err = mail.Send(*s.closer, msg)
+	if err != nil {
+		(*s.closer).Close()
+		s.closer = nil
+
+		return err
+	}
+
+	return nil
 }
 
 // NewService if the ServiceFactory for an initialized Service
 func NewService(ctx gousu.IContext) gousu.IService {
 	return &Service{
-		channelIn:  make(chan *mail.Message),
-		channelOut: make(chan error),
-		log:        gousu.GetLogger(fmt.Sprintf("service.%s", ServiceName)),
+		log: gousu.GetLogger(fmt.Sprintf("service.%s", ServiceName)),
 	}
 }
 
